@@ -35,6 +35,8 @@ That's it :)
 
 ## Usage
 
+**NOTE**: Since I first wrote this tool, Sumologic has changed the rules surrounding their [search API](https://help.sumologic.com/APIs/Search-Job-API/About-the-Search-Job-API). What this means is that you can *only* use this tool if you are either using a **Trial** or **Enterprise** account. All other types of Sumologic accounts do *not* have access to the underlying API that this tool uses. Thank you Tony Tovar for bringing this to my attention!
+
 Before you can export all your Sumologic data, you'll need to configure
 `sumologic-export` and give it your Sumologic credentials.  To do this,
 simply run:
