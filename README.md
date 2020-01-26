@@ -4,6 +4,8 @@ Easily export your Sumologic log data.
 
 ![Box Sketch](https://github.com/rdegges/sumologic-export/raw/master/assets/box-sketch.jpg)
 
+**NOTE**: I no longer use Sumologic in my day-to-day life and am looking for a maintainer for this project. If you'd like to maintain this project, please get in touch with me via my email address: r@rdegges.com. Thank you!
+
 
 ## Purpose
 
