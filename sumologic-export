@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 sumologic-export
-~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~
 
 Export your Sumologic logs easily and quickly.
 
@@ -21,35 +21,35 @@ Written by Randall Degges (http://www.rdegges.com)
 
 from datetime import datetime, timedelta
 from json import dumps, loads
-from os import chmod, mkdir
+from os import chmod, mkdir, SEEK_END, SEEK_SET
 from os.path import exists, expanduser
 from subprocess import call
 from time import sleep
 
 from docopt import docopt
-from requests import get, post
+from requests import get, post, delete
 
 
 ##### GLOBALS
-VERSION = '0.0.2'
+VERSION = '0.0.4'
 CONFIG_FILE = expanduser('~/.sumo')
 
 
 # Pretty print datetime objects.
-prettify = lambda x: x.strftime('%Y-%m-%d')
+prettify = lambda x: x.strftime('%Y-%m-%dT%H-%M-%S')
 
 
 class Exporter(object):
     """Abstraction for exporting Sumologic logs."""
 
     # Default time increment to move forward by.
-    INCREMENT = timedelta(days=1)
+    INCREMENT = timedelta(hours=3)
 
     # Default timerange to use if no dates are specified.
     DEFAULT_TIMERANGE = timedelta(days=30)
 
     # Sumologic API constants.
-    SUMOLOGIC_URL = 'https://api.sumologic.com/api/v1/search/jobs'
+    SUMOLOGIC_URL = 'https://api.us2.sumologic.com/api/v1/search/jobs'
     SUMOLOGIC_HEADERS = {
         'content-type': 'application/json',
         'accept': 'application/json',
@@ -88,7 +88,7 @@ class Exporter(object):
 
         with open(CONFIG_FILE, 'rb') as cfg:
             creds = loads(cfg.read())
-            self.credentials = (creds['email'], creds['password'])
+            self.credentials = (creds['accessid'], creds['accesskey'])
 
         self.cookies = None
 
@@ -165,20 +165,25 @@ class Exporter(object):
             # If there are logs to be downloaded, let's do it.
             if total_logs:
                 print ' - Downloading %d logs.' % total_logs
-
-                logs = []
-                for log in self.get_logs(job_url, total_logs):
-                    logs.append(log)
-
                 print ' - Writing log file: exports/%s.json' % prettify(date)
                 with open('exports/%s.json' % prettify(date), 'wb') as exports:
-                    exports.write(dumps(logs, indent=2, sort_keys=True))
+                    exports.write('[\n')
 
+                    for log in self.get_logs(job_url, total_logs):
+                        exports.write(dumps(log)+ '\n')
+                        exports.write(',\n')
+                    # Delete that last comma
+                    exports.seek(0, SEEK_END)
+                    pos = exports.tell() - 2
+                    exports.seek(pos, SEEK_SET)
+                    exports.truncate()
+                    exports.write(']')
                 print ' - Compressing log file: exports/%s.json' % prettify(date)
                 call(['gzip', '-9', 'exports/%s.json' % prettify(date)])
             else:
                 print ' - No logs found.'
-
+            # Delete job
+            self.delete_job(job_url)
             # Move forward.
             date += self.INCREMENT
 
@@ -209,6 +214,7 @@ class Exporter(object):
                     }),
                     cookies = self.cookies,
                 )
+                print resp.text
                 if resp.cookies:
                     self.cookies = resp.cookies
 
@@ -239,15 +245,17 @@ class Exporter(object):
                 )
                 if resp.cookies:
                     self.cookies = resp.cookies
-
+                print(resp.text)
                 if resp.status_code == 200:
                     json = resp.json()
                     if json['state'] == 'DONE GATHERING RESULTS':
                         return json['messageCount']
-
+                    elif json['state'] == 'FORCE PAUSED':
+                        raise
                 raise
             except:
-                sleep(1)
+                print('Not done yet, sleeping...')
+                sleep(10)
 
     def get_logs(self, job_url, count):
         """
@@ -288,6 +296,30 @@ class Exporter(object):
                 except:
                     sleep(1)
 
+    def delete_job(self, job_url):
+        """
+        Delete SumoLogic search job
+
+        :param string job_url: The job URL
+
+        """
+        try:
+            resp = delete(
+                job_url,
+                auth = self.credentials,
+                headers = self.SUMOLOGIC_HEADERS,
+                timeout = self.TIMEOUT,
+                cookies = self.cookies,
+            )
+            print resp.text
+            if resp.cookies:
+                self.cookies = resp.cookies
+
+            if resp.status_code >= 200 and resp.status_code < 300:
+                return
+            raise
+        except:
+            raise
 
 def configure():
     """
@@ -299,9 +331,9 @@ def configure():
     print "To get started, we'll need to get your Sumologic credentials."
 
     while True:
-        email = raw_input('Enter your email: ').strip()
-        password = raw_input('Enter your password: ').strip()
-        if not (email or password):
+        accessid = raw_input('Enter Access ID: ').strip()
+        accesskey = raw_input('Enter Access Key: ').strip()
+        if not (accessid or accesskey):
             print '\nYour Sumologic credentials are needed to continue!\n'
             continue
 
@@ -310,8 +342,8 @@ def configure():
 
         with open(CONFIG_FILE, 'wb') as cfg:
             cfg.write(dumps({
-                'email': email,
-                'password': password,
+                'accessid': accessid,
+                'accesskey': accesskey,
             }, indent=2, sort_keys=True))
 
         # Make the configuration file only accessible to the current user --
@@ -341,3 +373,4 @@ def main(args):
 
 if __name__ == '__main__':
     main(docopt(__doc__, version=VERSION))
+
