@@ -25,7 +25,7 @@ from os import chmod, mkdir, SEEK_END, SEEK_SET
 from os.path import exists, expanduser
 from subprocess import call
 from time import sleep
-
+import sys
 from docopt import docopt
 from requests import get, post, delete
 
@@ -43,7 +43,7 @@ class Exporter(object):
     """Abstraction for exporting Sumologic logs."""
 
     # Default time increment to move forward by.
-    INCREMENT = timedelta(hours=3)
+    INCREMENT = timedelta(hours=1)
 
     # Default timerange to use if no dates are specified.
     DEFAULT_TIMERANGE = timedelta(days=30)
@@ -56,7 +56,7 @@ class Exporter(object):
     }
 
     # Amount of time to wait for API response.
-    TIMEOUT = 10
+    TIMEOUT = 20
 
     # Sumologic timezone to specify.
     TIMEZONE = 'PST'
@@ -150,6 +150,7 @@ class Exporter(object):
         print '--------------'
 
         date = self.start
+        print 'Start date/time: %s' % prettify(date)
         while date < self.stop:
 
             # Schedule the Sumologic job.
@@ -160,7 +161,11 @@ class Exporter(object):
             sleep(self.SLEEP_SECONDS)
 
             # Figure out how many logs there are for the given date.
-            total_logs = self.get_count(job_url)
+            try:
+                total_logs = self.get_count(job_url)
+            except Exception as e:
+                print str(e)
+                sys.exit(1)
 
             # If there are logs to be downloaded, let's do it.
             if total_logs:
@@ -169,9 +174,12 @@ class Exporter(object):
                 with open('exports/%s.json' % prettify(date), 'wb') as exports:
                     exports.write('[\n')
 
-                    for log in self.get_logs(job_url, total_logs):
-                        exports.write(dumps(log)+ '\n')
-                        exports.write(',\n')
+                    try:
+                        for log in self.get_logs(job_url, total_logs):
+                            exports.write(dumps(log)+ '\n')
+                            exports.write(',\n')
+                    except Exception as e:
+                        print e
                     # Delete that last comma
                     exports.seek(0, SEEK_END)
                     pos = exports.tell() - 2
@@ -183,7 +191,10 @@ class Exporter(object):
             else:
                 print ' - No logs found.'
             # Delete job
-            self.delete_job(job_url)
+            try:
+                self.delete_job(job_url)
+            except Exception as e:
+                print str(e)
             # Move forward.
             date += self.INCREMENT
 
@@ -220,8 +231,7 @@ class Exporter(object):
 
                 if resp.status_code == 202:
                     return '%s/%s' % (self.SUMOLOGIC_URL, resp.json()['id'])
-
-                raise
+                raise Exception('Could not create search job, response status code: {}, response text: {}'.format(resp.status_code,str(resp.text)))
             except:
                 sleep(1)
 
@@ -251,8 +261,8 @@ class Exporter(object):
                     if json['state'] == 'DONE GATHERING RESULTS':
                         return json['messageCount']
                     elif json['state'] == 'FORCE PAUSED':
-                        raise
-                raise
+                        raise Exception('State is FORCE PAUSED, exiting...')
+                raise Exception('Count of logs encountered an error, response code {}, response text: {}'.format(resp.status_code,str(resp.text)))
             except:
                 print('Not done yet, sleeping...')
                 sleep(10)
@@ -291,9 +301,9 @@ class Exporter(object):
                             yield log['map']
 
                         break
-
-                    raise
-                except:
+                    raise Exception('Get logs returned error, response code {}, response text: {}'.format(resp.status_code,str(resp.text)))
+                except Exception as e:
+                    print e
                     sleep(1)
 
     def delete_job(self, job_url):
@@ -317,7 +327,7 @@ class Exporter(object):
 
             if resp.status_code >= 200 and resp.status_code < 300:
                 return
-            raise
+            raise Exception('Could not delete job, response code {}, response text: {}'.format(resp.status_code,str(resp.text)))
         except:
             raise
 
