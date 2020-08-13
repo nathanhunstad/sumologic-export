@@ -1,3 +1,4 @@
 exports
 dist
+backup_files.sh
 *.egg-info
