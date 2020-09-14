@@ -8,12 +8,17 @@ Export your Sumologic logs easily and quickly.
 Usage:
     sumologic-export configure
     sumologic-export
-    sumologic-export <start> <stop>
+    sumologic-export <start> <stop> [--slice=<minutes>]
     sumologic-export
-        (<start> | -s <start> | --start <start>)
-        [(<stop> | -t <stop> | --stop <stop>)]
+        (<start> | -s <start> | --start <start>) [--slice=MINUTES]
+        [(<stop> | -t <stop> | --stop <stop>)] [--slice=MINUTES]
     sumologic-export (-h | --help)
     sumologic-export (-v | --version)
+
+Options:
+    -h --help           Show this screen.
+    -v --version        Show version.
+    --slice=MINUTES   Timeslice for each bucket in minutes [default: 60].
 
 Written by Randall Degges (http://www.rdegges.com)
 """
@@ -32,7 +37,7 @@ from requests import get, post, delete
 
 ##### GLOBALS
 VERSION = '0.0.4'
-CONFIG_FILE = expanduser('~/.sumo')
+CONFIG_FILE = expanduser('../.sumo')
 
 
 # Pretty print datetime objects.
@@ -42,8 +47,6 @@ prettify = lambda x: x.strftime('%Y-%m-%dT%H-%M-%S')
 class Exporter(object):
     """Abstraction for exporting Sumologic logs."""
 
-    # Default time increment to move forward by.
-    INCREMENT = timedelta(hours=1)
 
     # Default timerange to use if no dates are specified.
     DEFAULT_TIMERANGE = timedelta(days=30)
@@ -102,13 +105,20 @@ class Exporter(object):
         - Perform cleanup.
         - If no dates are specified, we'll set defaults.
         """
+        self.start = None
+        self.stop = None
         if start:
+            # Try YYYY-MM-DDTHH:MM:SSZ first
             try:
-                self.start = datetime.strptime(start, '%Y-%m-%d').replace(hour=0, minute=0, second=0, microsecond=0)
-            except:
-                print 'Invalid date format. Format must be YYYY-MM-DD.'
-                raise SystemExit(1)
-
+                self.start = datetime.strptime(start, '%Y-%m-%dT%H:%M:%SZ').replace(microsecond=0)
+            except ValueError:
+                pass
+            if not self.start:
+                try:
+                    self.start = datetime.strptime(start, '%Y-%m-%d').replace(hour=0, minute=0, second=0, microsecond=0)
+                except:
+                    print 'Invalid date format. Format must be YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ.'
+                    raise SystemExit(1)
             if self.start > datetime.now():
                 print 'Start date must be in the past!'
                 raise SystemExit(1)
@@ -116,19 +126,26 @@ class Exporter(object):
             self.start = (datetime.now() - self.DEFAULT_TIMERANGE).replace(hour=0, minute=0, second=0, microsecond=0)
 
         if stop:
+            # Try YYYY-MM-DDTHH:MM:SSZ first
             try:
-                self.stop = datetime.strptime(stop, '%Y-%m-%d').replace(hour=0, minute=0, second=0, microsecond=0)
-            except:
-                print 'Invalid date format. Format must be YYYY-MM-DD.'
-                raise SystemExit(1)
-
+                self.stop = datetime.strptime(stop, '%Y-%m-%dT%H:%M:%SZ').replace(microsecond=0)
+            except ValueError:
+                pass
+            if not self.stop:
+                try:
+                    self.stop = datetime.strptime(stop, '%Y-%m-%d').replace(hour=0, minute=0, second=0, microsecond=0)
+                except:
+                    print 'Invalid date format. Format must be YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ.'
+                    raise SystemExit(1)
             if self.stop > datetime.now():
                 print 'Stop date must be in the past!'
                 raise SystemExit(1)
         else:
             self.stop = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        print('Parsed dates: {} to {}'.format(self.start, self.stop))
+        sys.stdout.flush()
 
-    def export(self, start, stop):
+    def export(self, start, stop, timeslice):
         """
         Export all Sumologic logs from start to stop.
 
@@ -138,6 +155,7 @@ class Exporter(object):
         :param str start: The datetime at which to start downloading logs.
         :param str stop: The datetime at which to stop downloading logs.
         """
+        self.INCREMENT = timedelta(minutes=timeslice)
         # Validate / cleanup the date inputs.
         self.init_dates(start, stop)
 
@@ -145,12 +163,12 @@ class Exporter(object):
             prettify(self.start),
             prettify(self.stop),
         )
-
         print 'Exporting Logs'
         print '--------------'
 
         date = self.start
         print 'Start date/time: %s' % prettify(date)
+        sys.stdout.flush()
         while date < self.stop:
 
             # Schedule the Sumologic job.
@@ -210,6 +228,8 @@ class Exporter(object):
         :rtype: string
         :returns: The URL of the job.
         """
+        print('Creating job from {} to {}'.format(start.isoformat(), stop.isoformat()))
+        sys.stdout.flush()
         while True:
             try:
                 resp = post(
@@ -225,14 +245,16 @@ class Exporter(object):
                     }),
                     cookies = self.cookies,
                 )
-                print resp.text
+                print(resp.request.body)
+                sys.stdout.flush()
                 if resp.cookies:
                     self.cookies = resp.cookies
-
                 if resp.status_code == 202:
                     return '%s/%s' % (self.SUMOLOGIC_URL, resp.json()['id'])
                 raise Exception('Could not create search job, response status code: {}, response text: {}'.format(resp.status_code,str(resp.text)))
-            except:
+            except Exception as e:
+                print(e)
+                sys.stdout.flush()
                 sleep(1)
 
     def get_count(self, job_url):
@@ -256,16 +278,18 @@ class Exporter(object):
                 if resp.cookies:
                     self.cookies = resp.cookies
                 print(resp.text)
+                sys.stdout.flush()
                 if resp.status_code == 200:
                     json = resp.json()
                     if json['state'] == 'DONE GATHERING RESULTS':
                         return json['messageCount']
                     elif json['state'] == 'FORCE PAUSED':
-                        raise Exception('State is FORCE PAUSED, exiting...')
+                        print('State is FORCE PAUSED, retrieiving existing records')
+                        return json['messageCount']
                 raise Exception('Count of logs encountered an error, response code {}, response text: {}'.format(resp.status_code,str(resp.text)))
-            except:
+            except Exception as e:
                 print('Not done yet, sleeping...')
-                sleep(10)
+                sleep(30)
 
     def get_logs(self, job_url, count):
         """
@@ -299,12 +323,12 @@ class Exporter(object):
                         json = resp.json()
                         for log in json['messages']:
                             yield log['map']
-
                         break
                     raise Exception('Get logs returned error, response code {}, response text: {}'.format(resp.status_code,str(resp.text)))
                 except Exception as e:
-                    print e
-                    sleep(1)
+                    print(e)
+                    sys.stdout.flush()
+                    sleep(10)
 
     def delete_job(self, job_url):
         """
@@ -321,7 +345,6 @@ class Exporter(object):
                 timeout = self.TIMEOUT,
                 cookies = self.cookies,
             )
-            print resp.text
             if resp.cookies:
                 self.cookies = resp.cookies
 
@@ -335,7 +358,7 @@ def configure():
     """
     Read in and store the user's Sumologic credentials.
 
-    Credentials will be stored in ~/.sumo
+    Credentials will be stored in ../.sumo
     """
     print 'Initializing `sumologic-export`...\n'
     print "To get started, we'll need to get your Sumologic credentials."
@@ -369,16 +392,17 @@ def main(args):
 
     :param args: Command line arguments.
     """
-    if args['-v']:
+    print(args)
+    if args.get('-v'):
         print VERSION
         raise SystemExit()
 
-    elif args['configure']:
+    elif args.get('configure'):
         configure()
         raise SystemExit()
 
     exporter = Exporter()
-    exporter.export(args['<start>'], args['<stop>'])
+    exporter.export(args['<start>'], args['<stop>'], int(args['--slice'][0]))
 
 
 if __name__ == '__main__':
