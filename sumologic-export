@@ -6,19 +6,23 @@ sumologic-export
 Export your Sumologic logs easily and quickly.
 
 Usage:
-    sumologic-export configure
+    sumologic-export configure [--config=CONFIG]
     sumologic-export
-    sumologic-export <start> <stop> [--slice=<minutes>]
+    sumologic-export <start> <stop> [--url=URL] [--slice=MINUTES] [--config=CONFIG] [--loglevel=LOGLEVEL] [--logfile=LOGFILE]
     sumologic-export
-        (<start> | -s <start> | --start <start>) [--slice=MINUTES]
-        [(<stop> | -t <stop> | --stop <stop>)] [--slice=MINUTES]
+        (<start> | -s <start> | --start <start>)
+        [(<stop> | -t <stop> | --stop <stop>)] [--url=URL] [--slice=MINUTES] [--config=CONFIG] [--loglevel=LOGLEVEL] [--logfile=LOGFILE]
     sumologic-export (-h | --help)
     sumologic-export (-v | --version)
 
 Options:
-    -h --help           Show this screen.
-    -v --version        Show version.
-    --slice=MINUTES   Timeslice for each bucket in minutes [default: 60].
+    -h --help               Show this screen.
+    -v --version            Show version.
+    --url=URL               URL for SumoLogic API calls [default: https://api.us2.sumologic.com/api/v1/search/jobs]
+    --slice=MINUTES         Timeslice for each bucket in minutes [default: 60].
+    --config=CONFIG         Config file location [default: ~/.sumo].
+    --loglevel=LOGLEVEL     Log level [default: INFO].
+    --logfile=LOGFILE       Log file location [default: stdout].
 
 Written by Randall Degges (http://www.rdegges.com)
 """
@@ -31,18 +35,17 @@ from os.path import exists, expanduser
 from subprocess import call
 from time import sleep
 import sys
+import logging
 from docopt import docopt
 from requests import get, post, delete
 
 
 ##### GLOBALS
-VERSION = '0.0.4'
-CONFIG_FILE = expanduser('../.sumo')
+VERSION = '0.9.0'
 
 
 # Pretty print datetime objects.
 prettify = lambda x: x.strftime('%Y-%m-%dT%H-%M-%S')
-
 
 class Exporter(object):
     """Abstraction for exporting Sumologic logs."""
@@ -50,9 +53,13 @@ class Exporter(object):
 
     # Default timerange to use if no dates are specified.
     DEFAULT_TIMERANGE = timedelta(days=30)
+    SUPPORTED_TIME_FORMATS = [
+        '%Y-%m-%d',
+        '%Y-%m-%dT%H:%M:%SZ',
+        '%Y-%m-%dT%H:%M:%S.%fZ'
+    ]
 
     # Sumologic API constants.
-    SUMOLOGIC_URL = 'https://api.us2.sumologic.com/api/v1/search/jobs'
     SUMOLOGIC_HEADERS = {
         'content-type': 'application/json',
         'accept': 'application/json',
@@ -62,7 +69,7 @@ class Exporter(object):
     TIMEOUT = 20
 
     # Sumologic timezone to specify.
-    TIMEZONE = 'PST'
+    TIMEZONE = 'UTC'
 
     # Amount of time to pause before requesting Sumologic logs.  60 seconds
     # seems to be a good amount of time.
@@ -72,7 +79,7 @@ class Exporter(object):
     # is, the more memory is used, but the faster the exports are.
     MESSAGES_PER_PAGE = 10000
 
-    def __init__(self):
+    def __init__(self, url, config, loglevel, logfile):
         """
         Initialize this exporter.
 
@@ -82,8 +89,9 @@ class Exporter(object):
         - Prepping the environment.
         - Setting up class variables.
         """
+        CONFIG_FILE = expanduser(config)
         if not exists(CONFIG_FILE):
-            print 'No credentials found! Run sumologic-export configure'
+            print('No credentials found! Run sumologic-export configure')
             raise SystemExit()
 
         if not exists('exports'):
@@ -93,7 +101,22 @@ class Exporter(object):
             creds = loads(cfg.read())
             self.credentials = (creds['accessid'], creds['accesskey'])
 
+        self.url = url
         self.cookies = None
+        self.start = None
+        self.stop = None
+        logger = logging.getLogger('sumologic-exporter')
+        formatter = logging.Formatter('[%(asctime)s] %(levelname)s: %(message)s')
+        if logfile == 'stdout':
+            hdlr = logging.StreamHandler(sys.stdout)
+        else:
+            hdlr = logging.FileHandler(logfile)
+        hdlr.setFormatter(formatter)
+        logger.addHandler(hdlr)
+        loggerlevel = logging.getLevelName(loglevel)
+        logger.setLevel(loggerlevel)
+        logger.propagate = False
+        self.logger = logger
 
     def init_dates(self, start, stop):
         """
@@ -105,45 +128,44 @@ class Exporter(object):
         - Perform cleanup.
         - If no dates are specified, we'll set defaults.
         """
-        self.start = None
-        self.stop = None
+
         if start:
-            # Try YYYY-MM-DDTHH:MM:SSZ first
-            try:
-                self.start = datetime.strptime(start, '%Y-%m-%dT%H:%M:%SZ').replace(microsecond=0)
-            except ValueError:
-                pass
+            for tf in self.SUPPORTED_TIME_FORMATS:
+                try:
+                    self.start = datetime.strptime(start, tf)
+                except ValueError:
+                    pass
             if not self.start:
                 try:
-                    self.start = datetime.strptime(start, '%Y-%m-%d').replace(hour=0, minute=0, second=0, microsecond=0)
+                    self.start = datetime.fromtimestamp(start)
                 except:
-                    print 'Invalid date format. Format must be YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ.'
+                    self.logger.error('Invalid start date format. Format must be one of the following or Unix epoch time: {}'.format(self.SUPPORTED_TIME_FORMATS))
                     raise SystemExit(1)
             if self.start > datetime.now():
-                print 'Start date must be in the past!'
+                self.logger.error('Start date must be in the past!')
                 raise SystemExit(1)
         else:
             self.start = (datetime.now() - self.DEFAULT_TIMERANGE).replace(hour=0, minute=0, second=0, microsecond=0)
 
         if stop:
             # Try YYYY-MM-DDTHH:MM:SSZ first
-            try:
-                self.stop = datetime.strptime(stop, '%Y-%m-%dT%H:%M:%SZ').replace(microsecond=0)
-            except ValueError:
-                pass
+            for tf in self.SUPPORTED_TIME_FORMATS:
+                try:
+                    self.stop = datetime.strptime(stop, tf)
+                except ValueError:
+                    pass
             if not self.stop:
                 try:
-                    self.stop = datetime.strptime(stop, '%Y-%m-%d').replace(hour=0, minute=0, second=0, microsecond=0)
+                    self.stop = datetime.fromtimestamp(stop)
                 except:
-                    print 'Invalid date format. Format must be YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ.'
+                    self.logger.error('Invalid stop date format. Format must be one of the following or Unix epoch time: {}'.format(self.SUPPORTED_TIME_FORMATS))
                     raise SystemExit(1)
             if self.stop > datetime.now():
-                print 'Stop date must be in the past!'
+                self.logger.error('Stop date must be in the past!')
                 raise SystemExit(1)
         else:
             self.stop = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        print('Parsed dates: {} to {}'.format(self.start, self.stop))
-        sys.stdout.flush()
+        self.logger.debug('Parsed dates: {} to {}'.format(self.start, self.stop))
 
     def export(self, start, stop, timeslice):
         """
@@ -155,68 +177,80 @@ class Exporter(object):
         :param str start: The datetime at which to start downloading logs.
         :param str stop: The datetime at which to stop downloading logs.
         """
+        # Check to see if stop-start is smaller than timelice
         self.INCREMENT = timedelta(minutes=timeslice)
         # Validate / cleanup the date inputs.
         self.init_dates(start, stop)
-
-        print 'Exporting all logs from: %s to %s... This may take a while.\n' % (
+        if self.stop - self.start < self.INCREMENT:
+            self.INCREMENT = self.stop - self.start
+        msg = 'Exporting all logs from: {} to P{}... This may take a while.\n'.format(
             prettify(self.start),
             prettify(self.stop),
         )
-        print 'Exporting Logs'
-        print '--------------'
+        self.logger.info(msg)
+        self.logger.debug('Start date/time: {}, stop date/time: {}'.format(prettify(self.start), prettify(self.stop)))
+        slice_start = self.start
+        while slice_start < self.stop:
+            self.get_next_slice(slice_start, self.INCREMENT)
+            # Move forward.
+            slice_start += self.INCREMENT
+        self.logger.info('Finished downloading logs!')
 
-        date = self.start
-        print 'Start date/time: %s' % prettify(date)
-        sys.stdout.flush()
-        while date < self.stop:
+    def get_next_slice(self, slice_start, timeslice):
+        # Schedule the Sumologic job.
+        job_url = self.create_job(slice_start, slice_start + timeslice)
 
-            # Schedule the Sumologic job.
-            job_url = self.create_job(date, date + self.INCREMENT)
-            print '-', prettify(date)
+        # Pause to allow Sumologic to process this job.
+        sleep(self.SLEEP_SECONDS)
 
-            # Pause to allow Sumologic to process this job.
-            sleep(self.SLEEP_SECONDS)
+        # Figure out how many logs there are for the given date.
+        try:
+            total_logs = self.get_count(job_url)
+        except Exception as e:
+            self.logger.error(e)
+            sys.exit(1)
 
-            # Figure out how many logs there are for the given date.
-            try:
-                total_logs = self.get_count(job_url)
-            except Exception as e:
-                print str(e)
-                sys.exit(1)
-
-            # If there are logs to be downloaded, let's do it.
-            if total_logs:
-                print ' - Downloading %d logs.' % total_logs
-                print ' - Writing log file: exports/%s.json' % prettify(date)
-                with open('exports/%s.json' % prettify(date), 'wb') as exports:
-                    exports.write('[\n')
-
-                    try:
-                        for log in self.get_logs(job_url, total_logs):
-                            exports.write(dumps(log)+ '\n')
-                            exports.write(',\n')
-                    except Exception as e:
-                        print e
-                    # Delete that last comma
-                    exports.seek(0, SEEK_END)
-                    pos = exports.tell() - 2
-                    exports.seek(pos, SEEK_SET)
-                    exports.truncate()
-                    exports.write(']')
-                print ' - Compressing log file: exports/%s.json' % prettify(date)
-                call(['gzip', '-9', 'exports/%s.json' % prettify(date)])
-            else:
-                print ' - No logs found.'
-            # Delete job
+        # If there are logs to be downloaded, let's do it.
+        if total_logs > 0:
+            msg = 'Downloading {} logs to file exports/{}.json.'.format( 
+                total_logs,
+                prettify(slice_start)
+            )
+            self.logger.info(msg)
+            with open('exports/{}.json'.format(prettify(slice_start)), 'wb') as exports:
+                # Due to the large amount of memory using json.dump can take, write each line out individually instead and wrap it in a json list
+                exports.write(str.encode('[\n'))
+                try:
+                    for log in self.get_logs(job_url, total_logs):
+                        exports.write(str.encode(dumps(log)+'\n'))
+                        exports.write(str.encode(',\n'))
+                except Exception as e:
+                    self.logger.error(e)
+                # Delete that last comma
+                exports.seek(0, SEEK_END)
+                pos = exports.tell() - 2
+                exports.seek(pos, SEEK_SET)
+                exports.truncate()
+                exports.write(str.encode(']'))
+            self.logger.info('Compressing log file: exports/{}.json'.format(prettify(slice_start)))
+            call(['gzip', '-9', 'exports/{}.json'.format(prettify(slice_start))])
+        elif total_logs == -1:
+            #State is FORCE PAUSED, split into smaller slice
+            self.logger.info('Slice has too many events, splitting in half')
             try:
                 self.delete_job(job_url)
             except Exception as e:
-                print str(e)
-            # Move forward.
-            date += self.INCREMENT
-
-        print '\nFinished downloading logs!'
+                self.logger.error(e)
+            self.get_next_slice(slice_start, (timeslice/2))
+            self.get_next_slice(slice_start+timeslice/2, (timeslice/2))
+        else:
+            msg = 'No logs found for time slice.'
+            self.logger.info(msg)
+        # Delete job
+        try:
+            self.delete_job(job_url)
+        except Exception as e:
+            self.logger.error(e)
 
     def create_job(self, start, stop):
         """
@@ -228,34 +262,29 @@ class Exporter(object):
         :rtype: string
         :returns: The URL of the job.
         """
-        print('Creating job from {} to {}'.format(start.isoformat(), stop.isoformat()))
-        sys.stdout.flush()
-        while True:
-            try:
-                resp = post(
-                    self.SUMOLOGIC_URL,
-                    auth = self.credentials,
-                    headers = self.SUMOLOGIC_HEADERS,
-                    timeout = self.TIMEOUT,
-                    data = dumps({
-                        'query': '*',
-                        'from': start.isoformat(),
-                        'to': stop.isoformat(),
-                        'timeZone': self.TIMEZONE,
-                    }),
-                    cookies = self.cookies,
-                )
-                print(resp.request.body)
-                sys.stdout.flush()
-                if resp.cookies:
-                    self.cookies = resp.cookies
-                if resp.status_code == 202:
-                    return '%s/%s' % (self.SUMOLOGIC_URL, resp.json()['id'])
-                raise Exception('Could not create search job, response status code: {}, response text: {}'.format(resp.status_code,str(resp.text)))
-            except Exception as e:
-                print(e)
-                sys.stdout.flush()
-                sleep(1)
+        msg = 'Creating job from {} to {}'.format(start.isoformat(), stop.isoformat())
+        self.logger.info(msg)
+        resp = post(
+            self.url,
+            auth = self.credentials,
+            headers = self.SUMOLOGIC_HEADERS,
+            timeout = self.TIMEOUT,
+            data = dumps({
+                'query': '*',
+                'from': start.isoformat(),
+                'to': stop.isoformat(),
+                'timeZone': self.TIMEZONE,
+            }),
+            cookies = self.cookies,
+        )
+        self.logger.debug('Job request results: {}'.format(resp.text))
+        if resp.cookies:
+            self.cookies = resp.cookies
+        if resp.status_code == 202:
+            return '{}/{}'.format(self.url, resp.json()['id'])
+        else:
+            self.logger.error('Could not create search job, response status code: {}, response text: {}'.format(resp.status_code,str(resp.text)))
+            return None
 
     def get_count(self, job_url):
         """
@@ -267,29 +296,26 @@ class Exporter(object):
         :returns: The amount of logs found in the specified job results.
         """
         while True:
-            try:
-                resp = get(
-                    job_url,
-                    auth = self.credentials,
-                    headers = self.SUMOLOGIC_HEADERS,
-                    timeout = self.TIMEOUT,
-                    cookies = self.cookies,
-                )
-                if resp.cookies:
-                    self.cookies = resp.cookies
-                print(resp.text)
-                sys.stdout.flush()
-                if resp.status_code == 200:
-                    json = resp.json()
-                    if json['state'] == 'DONE GATHERING RESULTS':
-                        return json['messageCount']
-                    elif json['state'] == 'FORCE PAUSED':
-                        print('State is FORCE PAUSED, retrieiving existing records')
-                        return json['messageCount']
-                raise Exception('Count of logs encountered an error, response code {}, response text: {}'.format(resp.status_code,str(resp.text)))
-            except Exception as e:
-                print('Not done yet, sleeping...')
-                sleep(30)
+            resp = get(
+                job_url,
+                auth = self.credentials,
+                headers = self.SUMOLOGIC_HEADERS,
+                timeout = self.TIMEOUT,
+                cookies = self.cookies,
+            )
+            if resp.cookies:
+                self.cookies = resp.cookies
+            self.logger.debug('get_count request results: {}'.format(resp.text))
+            if resp.status_code == 200:
+                json = resp.json()
+                if json['state'] == 'DONE GATHERING RESULTS':
+                    return json['messageCount']
+                elif json['state'] == 'FORCE PAUSED':
+                    return -1
+                elif json['state'] == 'GATHERING RESULTS':
+                    sleep(30)
+            else:
+                raise Exception('Get count returned error, response code {}, response text: {}'.format(resp.status_code,str(resp.text)))
 
     def get_logs(self, job_url, count):
         """
@@ -302,33 +328,29 @@ class Exporter(object):
         :returns: A generator which returns a single JSON log until all logs have
             been retrieved.
         """
-        for page in xrange(0, (count / self.MESSAGES_PER_PAGE) + 1):
+        for page in range(0, int(count / self.MESSAGES_PER_PAGE) + 1):
             while True:
-                try:
-                    resp = get(
-                        job_url + '/messages',
-                        auth = self.credentials,
-                        headers = self.SUMOLOGIC_HEADERS,
-                        timeout = self.TIMEOUT,
-                        params = {
-                            'limit': self.MESSAGES_PER_PAGE,
-                            'offset': self.MESSAGES_PER_PAGE * page,
-                        },
-                        cookies = self.cookies,
-                    )
-                    if resp.cookies:
-                        self.cookies = resp.cookies
+                resp = get(
+                    job_url + '/messages',
+                    auth = self.credentials,
+                    headers = self.SUMOLOGIC_HEADERS,
+                    timeout = self.TIMEOUT,
+                    params = {
+                        'limit': self.MESSAGES_PER_PAGE,
+                        'offset': self.MESSAGES_PER_PAGE * page,
+                    },
+                    cookies = self.cookies,
+                )
+                if resp.cookies:
+                    self.cookies = resp.cookies
 
-                    if resp.status_code == 200:
-                        json = resp.json()
-                        for log in json['messages']:
-                            yield log['map']
-                        break
+                if resp.status_code == 200:
+                    json = resp.json()
+                    for log in json['messages']:
+                        yield log['map']
+                    break
+                else:
                     raise Exception('Get logs returned error, response code {}, response text: {}'.format(resp.status_code,str(resp.text)))
-                except Exception as e:
-                    print(e)
-                    sys.stdout.flush()
-                    sleep(10)
 
     def delete_job(self, job_url):
         """
@@ -337,43 +359,40 @@ class Exporter(object):
         :param string job_url: The job URL
 
         """
-        try:
-            resp = delete(
-                job_url,
-                auth = self.credentials,
-                headers = self.SUMOLOGIC_HEADERS,
-                timeout = self.TIMEOUT,
-                cookies = self.cookies,
-            )
-            if resp.cookies:
-                self.cookies = resp.cookies
+        resp = delete(
+            job_url,
+            auth = self.credentials,
+            headers = self.SUMOLOGIC_HEADERS,
+            timeout = self.TIMEOUT,
+            cookies = self.cookies,
+        )
+        if resp.cookies:
+            self.cookies = resp.cookies
 
-            if resp.status_code >= 200 and resp.status_code < 300:
-                return
-            raise Exception('Could not delete job, response code {}, response text: {}'.format(resp.status_code,str(resp.text)))
-        except:
-            raise
+        if resp.status_code >= 200 and resp.status_code < 300:
+            return
+        raise Exception('Could not delete job, response code {}, response text: {}'.format(resp.status_code,str(resp.text)))
 
-def configure():
+def configure(config_file):
     """
     Read in and store the user's Sumologic credentials.
 
     Credentials will be stored in ../.sumo
     """
-    print 'Initializing `sumologic-export`...\n'
-    print "To get started, we'll need to get your Sumologic credentials."
+    print('Initializing `sumologic-export`...\n')
+    print("To get started, we'll need to get your Sumologic credentials.")
 
     while True:
-        accessid = raw_input('Enter Access ID: ').strip()
-        accesskey = raw_input('Enter Access Key: ').strip()
+        accessid = input('Enter Access ID: ').strip()
+        accesskey = input('Enter Access Key: ').strip()
         if not (accessid or accesskey):
-            print '\nYour Sumologic credentials are needed to continue!\n'
+            print('\nYour Sumologic credentials are needed to continue!\n')
             continue
 
-        print 'Your API credentials are stored in the file:', CONFIG_FILE, '\n'
-        print 'Run sumologic-export for usage information.'
+        print('Your API credentials are stored in the file:', config_file, '\n')
+        print('Run sumologic-export for usage information.')
 
-        with open(CONFIG_FILE, 'wb') as cfg:
+        with open(config_file, 'w') as cfg:
             cfg.write(dumps({
                 'accessid': accessid,
                 'accesskey': accesskey,
@@ -381,7 +400,7 @@ def configure():
 
         # Make the configuration file only accessible to the current user --
         # this makes the credentials a bit more safe.
-        chmod(CONFIG_FILE, 0600)
+        chmod(config_file, 0o0600)
 
         break
 
@@ -392,18 +411,16 @@ def main(args):
 
     :param args: Command line arguments.
     """
-    print(args)
     if args.get('-v'):
-        print VERSION
+        print(VERSION)
         raise SystemExit()
 
     elif args.get('configure'):
-        configure()
+        configure(expanduser(args['--config']))
         raise SystemExit()
 
-    exporter = Exporter()
-    exporter.export(args['<start>'], args['<stop>'], int(args['--slice'][0]))
-
+    exporter = Exporter(args['--url'], args['--config'], args['--loglevel'], args['--logfile'])
+    exporter.export(args['<start>'], args['<stop>'], int(args['--slice']))
 
 if __name__ == '__main__':
     main(docopt(__doc__, version=VERSION))
