@@ -91,7 +91,7 @@ class Exporter(object):
         """
         CONFIG_FILE = expanduser(config)
         if not exists(CONFIG_FILE):
-            print('No credentials found! Run sumologic-export configure')
+            print('No credentials found! Run `sumologic-export configure`')
             raise SystemExit()
 
         if not exists('exports'):
@@ -208,7 +208,7 @@ class Exporter(object):
             total_logs = self.get_count(job_url)
         except Exception as e:
             self.logger.error(e)
-            sys.exit(1)
+            raise SystemExit(1)
 
         # If there are logs to be downloaded, let's do it.
         if total_logs > 0:
